@@ -22,6 +22,8 @@ go get github.com/darkit/turn
 
 ## 快速开始
 
+我们提供了多种优雅的API调用方式，满足不同的使用场景和偏好。
+
 ### 使用默认配置（最简方式）
 
 ```go
@@ -49,8 +51,11 @@ func main() {
     }
     
     // 服务器已启动，等待中断信号...
+    _ = server
 }
 ```
+
+> **提示**：当需要停止服务时，调用 `server.Stop()` 即可完成默认优雅停机，也可以传入 `context.WithTimeout` 等上下文控制最长等待时间。
 
 ### 自定义基于默认配置
 
@@ -79,9 +84,9 @@ func main() {
     }
     config.TurnIPProvider = ipProvider
     
-    // 解析CIDR
-    if err := config.ParseCIDRs(); err != nil {
-        slog.Error("无法解析拒绝的对等方IP", "error", err)
+    // 预处理配置（包含CIDR解析和验证）
+    if err := config.PrepareForStart(); err != nil {
+        slog.Error("配置预处理失败", "error", err)
         os.Exit(1)
     }
     
@@ -95,6 +100,170 @@ func main() {
     // 服务器已启动，等待中断信号...
 }
 ```
+
+### 使用构建器模式（推荐）
+
+```go
+package main
+
+import (
+    "log"
+    "github.com/darkit/turn"
+)
+
+func main() {
+    // 使用构建器模式，更灵活更清晰
+    server, err := turn.NewServerBuilder().
+        WithExternalIP("203.0.113.5").
+        WithPortRange("49152:49200").
+        WithLogging("json", "info").
+        Build()
+    
+    if err != nil {
+        log.Fatal("无法启动TURN服务器:", err)
+    }
+    
+    // 服务器已启动...
+}
+```
+
+### 使用链式配置（最优雅）
+
+```go
+package main
+
+import (
+    "log"
+    "github.com/darkit/turn"
+)
+
+func main() {
+    // 链式配置，支持直接启动
+    result := turn.NewConfigChain().
+        Address(":3478").
+        ExternalIP("203.0.113.5").
+        PortRange("49152:49200").
+        Logging("json", "info").
+        Start()
+    
+    server := result.
+        LogError("服务器启动失败").
+        Unwrap()
+    
+    // 服务器已启动...
+}
+```
+
+### 快速启动函数
+
+```go
+package main
+
+import (
+    "log"
+    "github.com/darkit/turn"
+)
+
+func main() {
+    // 一行代码启动服务器
+    server, err := turn.QuickStart("203.0.113.5")
+    if err != nil {
+        log.Fatal(err)
+    }
+    
+    // 或者带选项的快速启动
+    server, err = turn.QuickStart("203.0.113.5",
+        turn.WithPortRangeOption("49160:49200"),
+        turn.WithDebugOption(),
+    )
+}
+```
+
+### 使用外部认证模式
+
+```go
+package main
+
+import (
+    "log/slog"
+    "os"
+    "github.com/darkit/turn"
+)
+
+func main() {
+    // 使用外部认证配置
+    config, err := turn.DefaultConfigWithAuth("203.0.113.5", "your-secret-key-at-least-16-chars")
+    if err != nil {
+        slog.Error("无法创建认证配置", "error", err)
+        os.Exit(1)
+    }
+    
+    // 启动服务器
+    server, err := turn.Start(config)
+    if err != nil {
+        slog.Error("无法启动TURN服务器", "error", err)
+        os.Exit(1)
+    }
+    
+    // 生成用户凭证
+    username, password := server.Credentials("user123", nil)
+    slog.Info("生成用户凭证", "username", username, "password", password)
+    
+    // 服务器已启动，等待中断信号...
+}
+```
+
+### 使用服务器管理器
+
+```go
+package main
+
+import (
+    "log"
+    "time"
+    "github.com/darkit/turn"
+)
+
+func main() {
+    // 启动服务器
+    server, err := turn.QuickStartWithAuth("203.0.113.5", "your-secret-key")
+    if err != nil {
+        log.Fatal(err)
+    }
+    
+    // 创建管理器
+    manager := turn.WithManager(server, turn.Config{})
+    
+    // 启动自动清理（每小时清理不活跃24小时的用户）
+    manager.StartCleanupRoutine(time.Hour, 24*time.Hour)
+    
+    // 创建用户
+    username, password, err := manager.CreateUser("user123", clientIP)
+    if err != nil {
+        log.Printf("创建用户失败: %v", err)
+    }
+    
+    // 获取统计信息
+    stats := manager.GetStats()
+    log.Printf("活跃用户: %d, 总用户: %d", stats.ActiveUsers, stats.TotalUsers)
+}
+```
+
+### 优雅停机（推荐实践）
+
+```go
+ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+defer cancel()
+
+if err := server.Stop(ctx); err != nil {
+    slog.Error("停止服务器失败", "error", err)
+}
+
+// 如果使用 ServerManager，可以直接透传上下文
+manager.Stop(ctx)
+```
+
+如无特殊需要，可直接调用 `server.Stop()` 或 `manager.Stop()` 使用默认上下文完成优雅停机。
 
 ### 完全自定义配置
 
@@ -126,9 +295,9 @@ func main() {
         TurnDenyPeers:   []string{"0.0.0.0/8", "127.0.0.1/8"},
     }
     
-    // 解析CIDR
-    if err := config.ParseCIDRs(); err != nil {
-        slog.Error("无法解析拒绝的对等方IP", "error", err)
+    // 预处理配置
+    if err := config.PrepareForStart(); err != nil {
+        slog.Error("配置预处理失败", "error", err)
         os.Exit(1)
     }
     
@@ -169,9 +338,9 @@ func main() {
     }
     config.TurnIPProvider = ipProvider
     
-    // 解析CIDR
-    if err := config.ParseCIDRs(); err != nil {
-        slog.Error("无法解析拒绝的对等方IP", "error", err)
+    // 预处理配置
+    if err := config.PrepareForStart(); err != nil {
+        slog.Error("配置预处理失败", "error", err)
         os.Exit(1)
     }
     
@@ -300,10 +469,13 @@ IP地址提供者用于确定TURN服务器的外部IP地址，有以下几种实
    }
    ```
 
-3. **STUN探测器**：通过STUN服务器探测外部IP（简化实现）
+3. **STUN探测器**：通过 STUN 服务器实时探测外部 IP，内建 30 秒缓存与失败回退策略
    ```go
    provider, err := ipdns.NewProber("stun.l.google.com:19302", true)
    ```
+   - 内部会解析 `stun:`/`turn:` URL 并自动填充默认端口
+   - 探测成功后缓存结果 30 秒，后续读取直接使用缓存
+   - 探测失败时会短暂退避（1 秒）并保留上一组成功的 IP，保障服务连续性
 
 ### 认证模式
 
@@ -352,6 +524,9 @@ username, password := server.Credentials("user123", clientIP)
 
 // 禁用用户（通过黑名单机制实现）
 server.Disallow(username)
+
+// 也可以直接使用用户 ID，便于在认证层统一屏蔽
+server.Disallow("user123")
 ```
 
 外部认证模式下的黑名单机制会提取用户名中的ID部分（而不是时间戳），并将其加入黑名单。这样即使用户尝试使用有效的时间戳重新获取凭证，只要用户ID在黑名单中，认证仍会失败。
@@ -405,9 +580,43 @@ turn.ConfigureLogger("console", "error")
 
 - `turn.DefaultConfig() Config` - 返回具有合理默认值的配置
 - `turn.DefaultConfigWithIP(externalIP string) (Config, error)` - 返回包含指定外部IP的默认配置
+- `turn.DefaultConfigWithAuth(externalIP, secret string) (Config, error)` - 返回包含外部认证的默认配置
 - `turn.Start(conf Config) (Server, error)` - 启动标准TURN服务器
 - `turn.StartTLS(conf Config) (Server, error)` - 启动支持TLS的TURN服务器
 - `turn.ConfigureLogger(format, level string)` - 配置日志系统
+
+### 构建器模式API
+
+- `turn.NewServerBuilder()` - 创建服务器构建器
+- `builder.WithExternalIP(ip)` - 设置外部IP
+- `builder.WithExternalAuth(secret)` - 启用外部认证
+- `builder.WithTLS(cert, key)` - 启用TLS
+- `builder.WithPortRange(range)` - 设置端口范围
+- `builder.Build()` - 构建服务器
+
+### 链式配置API
+
+- `turn.NewConfigChain()` - 创建配置链
+- `chain.ExternalIP(ip)` - 设置外部IP
+- `chain.ExternalSecret(secret)` - 设置外部认证
+- `chain.TLS(cert, key)` - 启用TLS
+- `chain.Start()` - 直接启动服务器
+
+### 快速启动API
+
+- `turn.QuickStart(externalIP, ...options)` - 快速启动服务器
+- `turn.QuickStartWithAuth(externalIP, secret, ...options)` - 快速启动认证服务器
+- `turn.WithTLSOption(cert, key)` - TLS选项
+- `turn.WithPortRangeOption(range)` - 端口范围选项
+- `turn.WithDebugOption()` - 调试选项
+
+### 服务器管理API
+
+- `turn.WithManager(server, config)` - 为服务器添加管理功能
+- `manager.CreateUser(id, ip)` - 创建用户
+- `manager.DisableUser(id)` - 禁用用户
+- `manager.GetStats()` - 获取统计信息
+- `manager.StartCleanupRoutine(interval, inactive)` - 启动清理例程
 
 ### 服务器接口
 

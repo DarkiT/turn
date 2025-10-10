@@ -14,6 +14,7 @@ import (
 
 // 定义命令行参数
 type cmdArgs struct {
+	enableTLS        bool
 	tlsCertFile      string
 	tlsKeyFile       string
 	turnAddress      string
@@ -56,7 +57,7 @@ func main() {
 
 	// 创建TURN服务器配置
 	config := turn.Config{
-		TLSEnabled:         true,
+		TLSEnabled:         args.enableTLS,
 		TLSCertFile:        args.tlsCertFile,
 		TLSKeyFile:         args.tlsKeyFile,
 		TurnAddress:        args.turnAddress,
@@ -68,17 +69,23 @@ func main() {
 		LogFormat:          args.logFormat,
 		LogLevel:           args.logLevel,
 		TurnIPProvider:     ipProvider,
-		TurnExternal:       args.turnSecret != "",
 	}
 
-	// 解析CIDR
-	if err := config.ParseCIDRs(); err != nil {
-		slog.Error("无法解析拒绝的对等方IP", "error", err)
+	// 预处理配置
+	if err := config.PrepareForStart(); err != nil {
+		slog.Error("配置预处理失败", "error", err)
 		os.Exit(1)
 	}
 
+	var server turn.Server
 	// 启动TURN服务器
-	server, err := turn.StartTLS(config)
+
+	if config.TLSEnabled {
+		server, err = turn.StartTLS(config)
+	} else {
+		server, err = turn.Start(config)
+	}
+
 	if err != nil {
 		slog.Error("无法启动TURN服务器", "error", err)
 		os.Exit(1)
@@ -91,13 +98,14 @@ func main() {
 
 	// 关闭服务器
 	slog.Info("正在关闭服务器...")
-	_ = server
+	server.Stop()
 }
 
 // 解析命令行参数
 func parseCmdArgs() cmdArgs {
 	var args cmdArgs
 
+	flag.BoolVar(&args.enableTLS, "enable-tls", false, "是否启用 TLS")
 	flag.StringVar(&args.tlsCertFile, "tls-cert", "", "TLS证书文件路径")
 	flag.StringVar(&args.tlsKeyFile, "tls-key", "", "TLS私钥文件路径")
 	flag.StringVar(&args.turnAddress, "turn-address", ":3478", "TURN服务器监听地址")
@@ -112,19 +120,21 @@ func parseCmdArgs() cmdArgs {
 	flag.Parse()
 
 	// 验证TLS证书和密钥文件
-	if args.tlsCertFile == "" || args.tlsKeyFile == "" {
-		slog.Error("必须提供TLS证书和私钥文件")
-		os.Exit(1)
-	}
+	if args.enableTLS {
+		if args.tlsCertFile == "" || args.tlsKeyFile == "" {
+			slog.Error("启用 TLS 时必须提供证书和私钥文件")
+			os.Exit(1)
+		}
 
-	// 检查文件是否存在
-	if !fileExists(args.tlsCertFile) {
-		slog.Error("TLS证书文件不存在", "file", args.tlsCertFile)
-		os.Exit(1)
-	}
-	if !fileExists(args.tlsKeyFile) {
-		slog.Error("TLS私钥文件不存在", "file", args.tlsKeyFile)
-		os.Exit(1)
+		// 检查文件是否存在
+		if !fileExists(args.tlsCertFile) {
+			slog.Error("TLS证书文件不存在", "file", args.tlsCertFile)
+			os.Exit(1)
+		}
+		if !fileExists(args.tlsKeyFile) {
+			slog.Error("TLS私钥文件不存在", "file", args.tlsKeyFile)
+			os.Exit(1)
+		}
 	}
 
 	return args
