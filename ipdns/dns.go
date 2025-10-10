@@ -3,12 +3,11 @@ package ipdns
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"net"
 	"strings"
 	"sync"
 	"time"
-
-	"log/slog"
 )
 
 // DNS 表示一个DNS提供者，用于通过DNS查找获取IP地址

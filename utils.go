@@ -18,7 +18,8 @@ func randString(length int) string {
 }
 
 var (
-	tokenCharacters = []byte("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-_!@#$%^&*()){}\\/=+,.><")
+	// 安全的字符集，避免特殊字符可能导致的安全问题
+	tokenCharacters = []byte("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
 	randReader      = rand.Reader
 )
 

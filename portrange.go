@@ -47,5 +47,36 @@ func (r *RelayAddressGeneratorPortRange) AllocatePacketConn(network string, requ
 }
 
 func (r *RelayAddressGeneratorPortRange) AllocateConn(network string, requestedPort int) (net.Conn, net.Addr, error) {
-	return nil, nil, errors.New("todo")
+	if requestedPort != 0 {
+		listener, err := net.Listen(network, fmt.Sprintf(":%d", requestedPort))
+		if err != nil {
+			return nil, nil, err
+		}
+		defer listener.Close()
+
+		// 接受一个连接
+		conn, err := listener.Accept()
+		if err != nil {
+			return nil, nil, err
+		}
+		return conn, conn.LocalAddr(), nil
+	}
+
+	for try := 0; try < 10; try++ {
+		port := r.MinPort + uint16(r.Rand.Intn(int((r.MaxPort+1)-r.MinPort)))
+		listener, err := net.Listen(network, fmt.Sprintf(":%d", port))
+		if err != nil {
+			continue
+		}
+		defer listener.Close()
+
+		// 接受一个连接
+		conn, err := listener.Accept()
+		if err != nil {
+			continue
+		}
+		return conn, conn.LocalAddr(), nil
+	}
+
+	return nil, nil, errors.New("找不到空闲端口: 超过最大重试次数")
 }

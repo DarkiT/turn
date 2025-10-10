@@ -1,9 +1,11 @@
 package turn
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/sha1"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -16,16 +18,33 @@ import (
 	"github.com/pion/turn/v4"
 )
 
-type Server interface {
+type serverCore interface {
 	Credentials(id string, addr net.IP) (string, string)
 	Disallow(username string)
 	Authenticate(username, realm string, addr net.Addr) ([]byte, bool)
 }
 
+// Server 表示可控制生命周期的 TURN 服务器
+type Server interface {
+	serverCore
+	Stop(ctx ...context.Context) error
+}
+
+var _ Server = (*runtimeServer)(nil)
+
+type runtimeServer struct {
+	core        serverCore
+	turnServer  *turn.Server
+	tcpListener net.Listener
+	udpListener net.PacketConn
+	stopOnce    sync.Once
+	stopErr     error
+	stopDone    chan struct{}
+}
+
 type InternalServer struct {
 	lock   sync.RWMutex
 	lookup map[string]Entry
-	Lookup map[string]Entry
 }
 
 type ExternalServer struct {
@@ -40,6 +59,77 @@ type Entry struct {
 	password []byte
 }
 
+func newRuntimeServer(core serverCore, turnSrv *turn.Server, tcpListener net.Listener, udpListener net.PacketConn) *runtimeServer {
+	return &runtimeServer{
+		core:        core,
+		turnServer:  turnSrv,
+		tcpListener: tcpListener,
+		udpListener: udpListener,
+		stopDone:    make(chan struct{}),
+	}
+}
+
+func (r *runtimeServer) Credentials(id string, addr net.IP) (string, string) {
+	return r.core.Credentials(id, addr)
+}
+
+func (r *runtimeServer) Disallow(username string) {
+	r.core.Disallow(username)
+}
+
+func (r *runtimeServer) Authenticate(username, realm string, addr net.Addr) ([]byte, bool) {
+	return r.core.Authenticate(username, realm, addr)
+}
+
+func (r *runtimeServer) Stop(ctx ...context.Context) error {
+	var waitCtx context.Context
+	if len(ctx) > 0 && ctx[0] != nil {
+		waitCtx = ctx[0]
+	} else {
+		waitCtx = context.Background()
+	}
+
+	r.stopOnce.Do(func() {
+		r.stopErr = r.shutdown()
+		close(r.stopDone)
+	})
+
+	select {
+	case <-r.stopDone:
+		return r.stopErr
+	case <-waitCtx.Done():
+		return waitCtx.Err()
+	}
+}
+
+func (r *runtimeServer) shutdown() error {
+	var errs []error
+
+	if r.turnServer != nil {
+		if err := r.turnServer.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+			errs = append(errs, err)
+		}
+	}
+
+	if r.tcpListener != nil {
+		if err := r.tcpListener.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+			errs = append(errs, err)
+		}
+	}
+
+	if r.udpListener != nil {
+		if err := r.udpListener.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+			errs = append(errs, err)
+		}
+	}
+
+	if len(errs) > 0 {
+		return errors.Join(errs...)
+	}
+
+	return nil
+}
+
 const Realm = "zishuo.net"
 
 type Generator struct {
@@ -50,22 +140,41 @@ type Generator struct {
 func (r *Generator) AllocatePacketConn(network string, requestedPort int) (net.PacketConn, net.Addr, error) {
 	conn, addr, err := r.RelayAddressGenerator.AllocatePacketConn(network, requestedPort)
 	if err != nil {
-		return conn, addr, err
+		return nil, nil, err
 	}
-	relayAddr := *addr.(*net.UDPAddr)
+
+	if r.IPProvider == nil {
+		_ = conn.Close()
+		return nil, nil, errors.New("TURN 未配置 IP 提供者")
+	}
+
+	udpAddr, ok := addr.(*net.UDPAddr)
+	if !ok {
+		_ = conn.Close()
+		return nil, nil, fmt.Errorf("TURN 分配到未知地址类型 %T", addr)
+	}
 
 	v4, v6, err := r.IPProvider.Get()
 	if err != nil {
-		return conn, addr, err
+		_ = conn.Close()
+		return nil, nil, err
 	}
 
-	if v6 == nil || (relayAddr.IP.To4() != nil && v4 != nil) {
+	if v4 == nil && v6 == nil {
+		_ = conn.Close()
+		return nil, nil, errors.New("TURN 无法获取任何外部 IP 地址")
+	}
+
+	relayAddr := *udpAddr
+	if v6 != nil && relayAddr.IP.To4() == nil {
+		relayAddr.IP = v6
+	} else if v4 != nil {
 		relayAddr.IP = v4
 	} else {
 		relayAddr.IP = v6
 	}
-	slog.Debug("TURN已分配", "addr", addr.String(), "relayaddr", relayAddr.String())
-	return conn, &relayAddr, err
+	slog.Debug("TURN已分配", "addr", udpAddr.String(), "relayaddr", relayAddr.String())
+	return conn, &relayAddr, nil
 }
 
 // DefaultConfig 返回一个具有合理默认值的TURN服务器配置
@@ -118,23 +227,83 @@ func DefaultConfigWithIP(externalIP string) (Config, error) {
 		config.TurnExternalIP = []string{externalIP}
 	}
 
-	// 预处理CIDR
-	if err := config.ParseCIDRs(); err != nil {
-		return config, fmt.Errorf("解析CIDR失败: %w", err)
+	// 预处理配置
+	if err := config.PrepareForStart(); err != nil {
+		return config, fmt.Errorf("配置预处理失败: %w", err)
 	}
 
 	return config, nil
 }
 
-func Start(conf Config) (Server, error) {
-	if conf.TurnExternal {
-		return newExternalServer(conf)
-	} else {
-		return newInternalServer(conf)
+// DefaultConfigWithAuth 返回一个包含外部认证的默认配置
+func DefaultConfigWithAuth(externalIP, secret string) (Config, error) {
+	config := DefaultConfig()
+
+	// 设置外部IP
+	if externalIP != "" {
+		ipProvider, err := ipdns.NewStatic([]string{externalIP})
+		if err != nil {
+			return config, fmt.Errorf("创建静态IP提供者失败: %w", err)
+		}
+		config.TurnIPProvider = ipProvider
+		config.TurnExternalIP = []string{externalIP}
 	}
+
+	// 设置外部认证
+	if secret != "" {
+		config.TurnExternalSecret = secret
+	}
+
+	// 预处理配置
+	if err := config.PrepareForStart(); err != nil {
+		return config, fmt.Errorf("配置预处理失败: %w", err)
+	}
+
+	return config, nil
 }
 
-func newExternalServer(conf Config) (Server, error) {
+// Start 根据配置启动一个 TURN/STUN 服务器
+func Start(conf Config) (Server, error) {
+	if err := (&conf).PrepareForStart(); err != nil {
+		return nil, fmt.Errorf("配置预处理失败: %w", err)
+	}
+
+	tcpListener, err := net.Listen("tcp", conf.TurnAddress)
+	if err != nil {
+		return nil, fmt.Errorf("tcp: 无法在 %s 上监听: %w", conf.TurnAddress, err)
+	}
+
+	udpListener, err := net.ListenPacket("udp", conf.TurnAddress)
+	if err != nil {
+		_ = tcpListener.Close()
+		return nil, fmt.Errorf("udp: 无法在 %s 上监听: %w", conf.TurnAddress, err)
+	}
+
+	core, err := createServerInstance(conf)
+	if err != nil {
+		_ = tcpListener.Close()
+		_ = udpListener.Close()
+		return nil, err
+	}
+
+	gen := &Generator{
+		RelayAddressGenerator: generator(conf),
+		IPProvider:            conf.TurnIPProvider,
+	}
+	permissions := createPermissionHandler(conf)
+
+	turnSrv, err := newTurnServer(core, tcpListener, udpListener, gen, permissions)
+	if err != nil {
+		return nil, err
+	}
+
+	runtime := newRuntimeServer(core, turnSrv, tcpListener, udpListener)
+
+	slog.Info("启动 TURN/STUN", "addr", conf.TurnAddress)
+	return runtime, nil
+}
+
+func newExternalServer(conf Config) (serverCore, error) {
 	return &ExternalServer{
 		secret:    []byte(conf.TurnExternalSecret),
 		ttl:       24 * time.Hour,
@@ -142,57 +311,11 @@ func newExternalServer(conf Config) (Server, error) {
 	}, nil
 }
 
-func newInternalServer(conf Config) (Server, error) {
-	udpListener, err := net.ListenPacket("udp", conf.TurnAddress)
-	if err != nil {
-		return nil, fmt.Errorf("udp: 无法在 %s 上监听: %s", conf.TurnAddress, err)
+func createServerInstance(conf Config) (serverCore, error) {
+	if conf.TurnExternal {
+		return newExternalServer(conf)
 	}
-	tcpListener, err := net.Listen("tcp", conf.TurnAddress)
-	if err != nil {
-		return nil, fmt.Errorf("tcp: 无法在 %s 上监听: %s", conf.TurnAddress, err)
-	}
-
-	svr := &InternalServer{lookup: map[string]Entry{}, Lookup: map[string]Entry{}}
-
-	gen := &Generator{
-		RelayAddressGenerator: generator(conf),
-		IPProvider:            conf.TurnIPProvider,
-	}
-
-	var permissions turn.PermissionHandler = func(clientAddr net.Addr, peerIP net.IP) bool {
-		for _, cidr := range conf.TurnDenyPeersParsed {
-			if cidr.Contains(peerIP) {
-				return false
-			}
-		}
-
-		return true
-	}
-
-	_, err = turn.NewServer(turn.ServerConfig{
-		Realm:       Realm,
-		AuthHandler: svr.authenticate,
-		ListenerConfigs: []turn.ListenerConfig{
-			{
-				Listener:              tcpListener,
-				RelayAddressGenerator: gen,
-				PermissionHandler:     permissions,
-			},
-		},
-		PacketConnConfigs: []turn.PacketConnConfig{
-			{
-				PacketConn:            udpListener,
-				RelayAddressGenerator: gen,
-				PermissionHandler:     permissions,
-			},
-		},
-	})
-	if err != nil {
-		return nil, err
-	}
-
-	slog.Info("启动 TURN/STUN", "addr", conf.TurnAddress)
-	return svr, nil
+	return &InternalServer{lookup: map[string]Entry{}}, nil
 }
 
 func generator(conf Config) turn.RelayAddressGenerator {
@@ -221,15 +344,17 @@ func (a *InternalServer) Disallow(username string) {
 }
 
 func (a *ExternalServer) Disallow(username string) {
-	// 提取用户ID部分
-	parts := strings.SplitN(username, ":", 2)
-	if len(parts) != 2 {
-		// 格式不正确，记录并返回
+	userID := username
+	if strings.Contains(username, ":") {
+		parts := strings.SplitN(username, ":", 2)
+		if len(parts) == 2 {
+			userID = parts[1]
+		}
+	}
+	if userID == "" {
 		slog.Debug("TURN禁用失败：无效的用户名格式", "username", username)
 		return
 	}
-
-	userID := parts[1]
 
 	// 将用户ID添加到黑名单
 	a.lock.Lock()
